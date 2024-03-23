@@ -826,6 +826,7 @@ class BeaconState(Container):
     next_withdrawal_validator_index: ValidatorIndex  # [New in Capella]
     # Deep history valid from Capella onwards
     historical_summaries: List[HistoricalSummary, HISTORICAL_ROOTS_LIMIT]  # [New in Capella]
+    slot_participation_rates: Dict[Slot, float] = field(default_factory=dict)
 
 
 class BlobSidecar(Container):
@@ -2634,6 +2635,11 @@ def process_attestation(state: BeaconState, attestation: Attestation) -> None:
         epoch_participation = state.current_epoch_participation
     else:
         epoch_participation = state.previous_epoch_participation
+        
+    participating_validators = get_attesting_indices(state, attestation)
+    committee_size = len(committee)
+    participation_rate = len(participating_validators) / committee_size
+    update_slot_participation_rate(state, data.slot, participation_rate)
 
     proposer_reward_numerator = 0
     for index in get_attesting_indices(state, attestation):
@@ -2641,12 +2647,29 @@ def process_attestation(state: BeaconState, attestation: Attestation) -> None:
             if flag_index in participation_flag_indices and not has_flag(epoch_participation[index], flag_index):
                 epoch_participation[index] = add_flag(epoch_participation[index], flag_index)
                 proposer_reward_numerator += get_base_reward(state, index) * weight
-
+               
     # Reward proposer
     proposer_reward_denominator = (WEIGHT_DENOMINATOR - PROPOSER_WEIGHT) * WEIGHT_DENOMINATOR // PROPOSER_WEIGHT
     proposer_reward = Gwei(proposer_reward_numerator // proposer_reward_denominator)
     increase_balance(state, get_beacon_proposer_index(state), proposer_reward)
 
+    
+def update_slot_participation_rate(state: BeaconState, slot: Slot, participation_rate: float) -> None:
+    """
+    Updates the BeaconState with the participation rate for a given slot.
+    
+    Args:
+        state (BeaconState): The current state of the beacon chain.
+        slot (Slot): The slot for which the participation rate is being updated.
+        participation_rate (float): The participation rate, represented as a float between 0 and 1.
+    """
+    # Ensure the participation rate is within valid bounds
+    if not 0 <= participation_rate <= 1:
+        raise ValueError("Participation rate must be between 0 and 1")
+    
+    # Update the participation rate for the given slot
+    state.slot_participation_rates[slot] = participation_rate
+    
 
 def get_validator_from_deposit(pubkey: BLSPubkey, withdrawal_credentials: Bytes32, amount: uint64) -> Validator:
     effective_balance = min(amount - amount % EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE)
@@ -3081,16 +3104,79 @@ def get_flag_index_deltas(state: BeaconState, flag_index: int) -> Tuple[Sequence
     unslashed_participating_balance = get_total_balance(state, unslashed_participating_indices)
     unslashed_participating_increments = unslashed_participating_balance // EFFECTIVE_BALANCE_INCREMENT
     active_increments = get_total_active_balance(state) // EFFECTIVE_BALANCE_INCREMENT
+    
     for index in get_eligible_validator_indices(state):
         base_reward = get_base_reward(state, index)
+        
+        slot_participation_rate = get_slot_participation_rate(state, slot_for_validator(index))
+        penalty_scale_factor = calculate_penalty_scale_factor(slot_participation_rate)
+        
         if index in unslashed_participating_indices:
             if not is_in_inactivity_leak(state):
                 reward_numerator = base_reward * weight * unslashed_participating_increments
                 rewards[index] += Gwei(reward_numerator // (active_increments * WEIGHT_DENOMINATOR))
         elif flag_index != TIMELY_HEAD_FLAG_INDEX:
-            penalties[index] += Gwei(base_reward * weight // WEIGHT_DENOMINATOR)
+            penalties[index] += Gwei(base_reward * weight / penalty_scale_factor // WEIGHT_DENOMINATOR)
     return rewards, penalties
 
+def get_slot_participation_rate(state: BeaconState, slot: Slot) -> float:
+    """
+    Fetch the participation rate for a given slot.
+    
+    Returns:
+        The participation rate for the slot, as a float between 0 and 1.
+    """
+    if slot in state.slot_participation_rates:
+        return state.slot_participation_rates[slot]
+    else:
+        raise Exception("Participation rate for the slot not found")
+
+def slot_for_validator(state: BeaconState, validator_index: ValidatorIndex, epoch: Epoch) -> Slot:
+    """
+    Determine the slot within the given epoch where the validator with `validator_index` is expected to attest.
+    
+    Args:
+        state (BeaconState): The current beacon chain state.
+        validator_index (ValidatorIndex): The index of the validator.
+        epoch (Epoch): The epoch for which to find the attestation slot.
+    
+    Returns:
+        Slot: The slot at which the validator is expected to attest.
+    """
+    # Calculate the range of slots for the given epoch
+    start_slot = compute_start_slot_at_epoch(epoch)
+    end_slot = start_slot + SLOTS_PER_EPOCH
+    
+    # Iterate over each slot in the epoch
+    for slot in range(start_slot, end_slot):
+        committees_per_slot = get_committee_count_per_slot(state, epoch)
+        # Iterate over each committee index for the slot
+        for index in range(committees_per_slot):
+            # Get the committee for the current slot and index
+            committee = get_beacon_committee(state, slot, index)
+            # Check if the validator is in the committee
+            if validator_index in committee:
+                return slot
+    
+    raise Exception(f"Validator {validator_index} not found in epoch {epoch}")
+
+def get_flag_index_deltas(state: BeaconState, flag_index: int) -> Tuple[Sequence[Gwei], Sequence[Gwei]]:
+    # Existing code to calculate rewards and penalties...
+    
+    for index in get_eligible_validator_indices(state):
+        
+        
+        if index not in unslashed_participating_indices and flag_index != TIMELY_HEAD_FLAG_INDEX:
+            penalties[index] += Gwei(base_reward * weight * penalty_scale_factor // WEIGHT_DENOMINATOR)
+    
+    return rewards, penalties
+
+
+def get_slot_correlation_factor(state: BeaconState, index: uint64):
+    committee_id = 
+    
+    committee_size = len(get_beacon_committee(state, data.slot, data.index))
+    
 
 def process_sync_aggregate(state: BeaconState, sync_aggregate: SyncAggregate) -> None:
     # Verify sync committee aggregate signature signing over the previous slot block root
